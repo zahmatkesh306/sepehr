@@ -1,0 +1,49 @@
+require('dotenv').config();
+const path = require('path');
+const http = require('http');
+const express = require('express');
+
+const { ensureAdmin } = require('./src/db');
+const { startXray } = require('./src/xray/runner');
+const { attachWsProxy } = require('./src/proxy');
+
+const authRoutes = require('./src/routes/auth');
+const { router: clientsRoutes, subscriptionHandler } = require('./src/routes/clients');
+const settingsRoutes = require('./src/routes/settings');
+
+ensureAdmin();
+
+const app = express();
+app.use(express.json());
+
+// فایل‌های استاتیک داشبورد
+app.use(express.static(path.join(__dirname, 'public')));
+
+// API
+app.use('/api/auth', authRoutes);
+app.use('/api/clients', clientsRoutes);
+app.use('/api/settings', settingsRoutes);
+
+// لینک عمومی سابسکریپشن هر کاربر
+app.get('/sub/:token', subscriptionHandler);
+
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Railway پورت را از طریق متغیر PORT مشخص می‌کند
+const PORT = process.env.PORT || 8080;
+
+// از http.createServer خام استفاده می‌کنیم تا بتوانیم رویداد 'upgrade'
+// (هندشیک وب‌ساکت VLESS/VMess/Trojan) را دستی به Xray فوروارد کنیم.
+const server = http.createServer(app);
+attachWsProxy(server);
+
+server.listen(PORT, () => {
+  console.log(`[panel] پنل روی پورت ${PORT} در حال اجراست`);
+  startXray();
+});
+
+// خاموش کردن تمیز هنگام ری‌دیپلوی روی Railway
+process.on('SIGTERM', () => {
+  console.log('[panel] سیگنال SIGTERM دریافت شد، خاموش می‌شود...');
+  server.close(() => process.exit(0));
+});
