@@ -1,0 +1,883 @@
+
+# (نیازی به فایل .env روی خود Railway نیست، ولی برای اجرای لوکال مفید است)
+
+# JWT_SECRET را حتماً به یک رشته‌ی تصادفی و طولانی تغییر دهید
+JWT_SECRET=change-this-to-a-long-random-string
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change-me-please
+
+# اختیاری: اگر خالی بگذارید، از RAILWAY_PUBLIC_DOMAIN (که خود Railway ست می‌کند)
+# استفاده می‌شود. بعداً هم می‌توانید از داخل خود پنل تغییرش دهید.
+DOMAIN=
+
+# توجه: PORT را Railway خودش ست می‌کند؛ نیازی به تنظیم دستی نیست.
+# توجه: DATA_DIR را روی Railway حتماً به مسیر یک Volume متصل کنید (مثلا /app/data)
+# تا با هر دیپلوی جدید، لیست کاربران پاک نشود.
+
+FROM node:20-slim
+
+# نصب ابزارهای لازم برای دانلود و آنزیپ Xray-core
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# نصب آخرین نسخه‌ی پایدار Xray-core (تگ لتست را از GitHub API می‌گیرد،
+# پس با هر بیلد جدید خودش به‌روز می‌ماند و نیازی به هاردکد نسخه نیست)
+RUN XRAY_TAG=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+') \
+    && echo "Installing Xray-core ${XRAY_TAG}" \
+    && curl -L -o /tmp/xray.zip \
+    "https://github.com/XTLS/Xray-core/releases/download/${XRAY_TAG}/Xray-linux-64.zip" \
+    && unzip /tmp/xray.zip -d /usr/local/bin xray \
+    && chmod +x /usr/local/bin/xray \
+    && rm /tmp/xray.zip
+
+ENV XRAY_BIN_PATH=/usr/local/bin/xray
+ENV DATA_DIR=/app/data
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
+
+COPY . .
+
+RUN mkdir -p /app/data
+
+EXPOSE 8080
+
+CMD ["node", "server.js"]
+
+{
+  "name": "xray-vpn-panel",
+  "version": "1.0.0",
+  "description": "پنل مدیریت اختصاصی برای Xray-core (VLESS / VMess / Trojan)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "http-proxy": "^1.18.1",
+    "jsonwebtoken": "^9.0.2",
+    "lowdb": "^1.0.0",
+    "uuid": "^9.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+
+const token = localStorage.getItem('panel_token');
+if (!token) window.location.href = '/login.html';
+
+const authHeaders = {
+  'Content-Type': 'application/json',
+  Authorization: `Bearer ${token}`,
+};
+
+document.getElementById('logoutBtn').addEventListener('click', () => {
+  localStorage.removeItem('panel_token');
+  window.location.href = '/login.html';
+});
+
+async function api(path, options = {}) {
+  const res = await fetch(path, { ...options, headers: authHeaders });
+  if (res.status === 401) {
+    localStorage.removeItem('panel_token');
+    window.location.href = '/login.html';
+    return;
+  }
+  if (res.status === 204) return null;
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'خطا');
+  return data;
+}
+
+async function loadSettings() {
+  const s = await api('/api/settings');
+  document.getElementById('domain').value = s.domain || '';
+}
+
+document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  await api('/api/settings', {
+    method: 'PUT',
+    body: JSON.stringify({
+      domain: document.getElementById('domain').value,
+    }),
+  });
+  alert('تنظیمات ذخیره شد و لینک‌های کاربران بر همین اساس ساخته می‌شوند.');
+});
+
+function renderClients(clients) {
+  const body = document.getElementById('clientsBody');
+  body.innerHTML = '';
+
+  clients.forEach((c) => {
+    const tr = document.createElement('tr');
+    tr.className = 'border-b border-slate-700/50';
+
+    const statusBadge = c.enabled
+      ? '<span class="px-2 py-0.5 rounded-full bg-emerald-600/20 text-emerald-400 text-xs">فعال</span>'
+      : '<span class="px-2 py-0.5 rounded-full bg-red-600/20 text-red-400 text-xs">غیرفعال</span>';
+
+    const subUrl = `${window.location.origin}/sub/${c.subToken}`;
+
+    tr.innerHTML = `
+      <td class="py-2">${c.name}</td>
+      <td class="uppercase">${c.protocol}</td>
+      <td>${statusBadge}</td>
+      <td>${c.expiresAt ? c.expiresAt.slice(0, 10) : '—'}</td>
+      <td>
+        <button class="text-indigo-400 hover:underline text-xs copy-btn" data-value="${c.link}">کپی لینک</button>
+      </td>
+      <td>
+        <button class="text-indigo-400 hover:underline text-xs copy-btn" data-value="${subUrl}">کپی سابسکریپشن</button>
+      </td>
+      <td class="space-x-2 space-x-reverse">
+        <button class="text-yellow-400 hover:underline text-xs toggle-btn" data-id="${c.id}" data-enabled="${c.enabled}">
+          ${c.enabled ? 'غیرفعال کن' : 'فعال کن'}
+        </button>
+        <button class="text-red-400 hover:underline text-xs delete-btn" data-id="${c.id}">حذف</button>
+      </td>
+    `;
+    body.appendChild(tr);
+  });
+
+  document.querySelectorAll('.copy-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      navigator.clipboard.writeText(btn.dataset.value);
+      btn.textContent = 'کپی شد ✓';
+      setTimeout(() => (btn.textContent = btn.dataset.value.startsWith('http') ? 'کپی سابسکریپشن' : 'کپی لینک'), 1500);
+    });
+  });
+
+  document.querySelectorAll('.toggle-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const enabled = btn.dataset.enabled === 'true';
+      await api(`/api/clients/${btn.dataset.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: !enabled }),
+      });
+      loadClients();
+    });
+  });
+
+  document.querySelectorAll('.delete-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('این کاربر حذف شود؟')) return;
+      await api(`/api/clients/${btn.dataset.id}`, { method: 'DELETE' });
+      loadClients();
+    });
+  });
+}
+
+async function loadClients() {
+  const clients = await api('/api/clients');
+  renderClients(clients);
+}
+
+document.getElementById('clientForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const name = document.getElementById('name').value;
+  const protocol = document.getElementById('protocol').value;
+  const expiresAt = document.getElementById('expiresAt').value || null;
+
+  await api('/api/clients', {
+    method: 'POST',
+    body: JSON.stringify({ name, protocol, expiresAt }),
+  });
+
+  e.target.reset();
+  loadClients();
+});
+
+loadSettings();
+loadClients();
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>پنل مدیریت VPN</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css"></script>
+<style>
+  body { font-family: 'Vazirmatn', Tahoma, sans-serif; background: #0f172a; }
+</style>
+</head>
+<body class="min-h-screen text-slate-100">
+<div class="max-w-5xl mx-auto p-6">
+
+  <div class="flex items-center justify-between mb-8">
+    <h1 class="text-2xl font-bold">پنل مدیریت VPN</h1>
+    <button id="logoutBtn" class="text-sm text-slate-400 hover:text-white">خروج</button>
+  </div>
+
+  <!-- تنظیمات دامنه و پورت‌ها -->
+  <div class="bg-slate-800 rounded-2xl p-5 mb-8">
+    <h2 class="font-semibold mb-4">تنظیمات سرور</h2>
+    <p class="text-slate-400 text-xs mb-3">
+      دامنه‌ای که Railway به این سرویس داده (یا دامنه‌ی اختصاصی خودتان) را اینجا وارد کنید.
+      همه‌ی پروتکل‌ها از طریق پورت ۴۴۳ و wss کار می‌کنند.
+    </p>
+    <form id="settingsForm" class="grid grid-cols-1 md:grid-cols-4 gap-3">
+      <input id="domain" placeholder="مثلا your-app.up.railway.app"
+        class="col-span-3 bg-slate-700 rounded-lg px-3 py-2 text-sm outline-none" />
+      <button type="submit"
+        class="bg-indigo-600 hover:bg-indigo-700 rounded-lg py-2 text-sm font-semibold">ذخیره تنظیمات</button>
+    </form>
+  </div>
+
+  <!-- فرم افزودن کلاینت -->
+  <div class="bg-slate-800 rounded-2xl p-5 mb-8">
+    <h2 class="font-semibold mb-4">افزودن کاربر جدید</h2>
+    <form id="clientForm" class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <input id="name" placeholder="نام کاربر" required
+        class="bg-slate-700 rounded-lg px-3 py-2 text-sm outline-none" />
+      <select id="protocol" class="bg-slate-700 rounded-lg px-3 py-2 text-sm outline-none">
+        <option value="vless">VLESS</option>
+        <option value="vmess">VMess</option>
+        <option value="trojan">Trojan</option>
+      </select>
+      <input id="expiresAt" type="date" placeholder="تاریخ انقضا"
+        class="bg-slate-700 rounded-lg px-3 py-2 text-sm outline-none" />
+      <button type="submit"
+        class="bg-emerald-600 hover:bg-emerald-700 rounded-lg py-2 text-sm font-semibold">افزودن کاربر</button>
+    </form>
+  </div>
+
+  <!-- لیست کاربران -->
+  <div class="bg-slate-800 rounded-2xl p-5">
+    <h2 class="font-semibold mb-4">کاربران</h2>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-slate-400 text-right border-b border-slate-700">
+            <th class="py-2">نام</th>
+            <th>پروتکل</th>
+            <th>وضعیت</th>
+            <th>انقضا</th>
+            <th>لینک اتصال</th>
+            <th>سابسکریپشن</th>
+            <th>عملیات</th>
+          </tr>
+        </thead>
+        <tbody id="clientsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ورود به پنل</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css"></script>
+<style>
+  body { font-family: 'Vazirmatn', Tahoma, sans-serif; background: #0f172a; }
+</style>
+</head>
+<body class="min-h-screen flex items-center justify-center">
+  <div class="bg-slate-800 rounded-2xl shadow-xl p-8 w-full max-w-sm">
+    <h1 class="text-2xl font-bold text-white mb-1">ورود به پنل</h1>
+    <p class="text-slate-400 text-sm mb-6">مدیریت سرویس VPN</p>
+
+    <form id="loginForm" class="space-y-4">
+      <div>
+        <label class="text-slate-300 text-sm block mb-1">نام کاربری</label>
+        <input id="username" type="text" required
+          class="w-full rounded-lg bg-slate-700 text-white px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500" />
+      </div>
+      <div>
+        <label class="text-slate-300 text-sm block mb-1">رمز عبور</label>
+        <input id="password" type="password" required
+          class="w-full rounded-lg bg-slate-700 text-white px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-500" />
+      </div>
+      <p id="errorMsg" class="text-red-400 text-sm hidden"></p>
+      <button type="submit"
+        class="w-full bg-indigo-600 hover:bg-indigo-700 transition text-white rounded-lg py-2 font-semibold">
+        ورود
+      </button>
+    </form>
+  </div>
+
+<script>
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  const errorMsg = document.getElementById('errorMsg');
+  errorMsg.classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'خطا در ورود');
+
+    localStorage.setItem('panel_token', data.token);
+    window.location.href = '/index.html';
+  } catch (err) {
+    errorMsg.textContent = err.message;
+    errorMsg.classList.remove('hidden');
+  }
+});
+</script>
+</body>
+</html>
+
+{
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}
+
+require('dotenv').config();
+const path = require('path');
+const http = require('http');
+const express = require('express');
+
+const { ensureAdmin } = require('./src/db');
+const { startXray } = require('./src/xray/runner');
+const { attachWsProxy } = require('./src/proxy');
+
+const authRoutes = require('./src/routes/auth');
+const { router: clientsRoutes, subscriptionHandler } = require('./src/routes/clients');
+const settingsRoutes = require('./src/routes/settings');
+
+ensureAdmin();
+
+const app = express();
+app.use(express.json());
+
+// فایل‌های استاتیک داشبورد
+app.use(express.static(path.join(__dirname, 'public')));
+
+// API
+app.use('/api/auth', authRoutes);
+app.use('/api/clients', clientsRoutes);
+app.use('/api/settings', settingsRoutes);
+
+// لینک عمومی سابسکریپشن هر کاربر
+app.get('/sub/:token', subscriptionHandler);
+
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Railway پورت را از طریق متغیر PORT مشخص می‌کند
+const PORT = process.env.PORT || 8080;
+
+// از http.createServer خام استفاده می‌کنیم تا بتوانیم رویداد 'upgrade'
+// (هندشیک وب‌ساکت VLESS/VMess/Trojan) را دستی به Xray فوروارد کنیم.
+const server = http.createServer(app);
+attachWsProxy(server);
+
+server.listen(PORT, () => {
+  console.log(`[panel] پنل روی پورت ${PORT} در حال اجراست`);
+  startXray();
+});
+
+// خاموش کردن تمیز هنگام ری‌دیپلوی روی Railway
+process.on('SIGTERM', () => {
+  console.log('[panel] سیگنال SIGTERM دریافت شد، خاموش می‌شود...');
+  server.close(() => process.exit(0));
+});
+
+const jwt = require('jsonwebtoken');
+
+const SECRET = process.env.JWT_SECRET || 'insecure-dev-secret';
+
+function signToken(payload) {
+  return jwt.sign(payload, SECRET, { expiresIn: '12h' });
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'توکن ارسال نشده است' });
+
+  try {
+    req.admin = jwt.verify(token, SECRET);
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'توکن نامعتبر یا منقضی‌شده' });
+  }
+}
+
+module.exports = { signToken, requireAuth };
+
+const fs = require('fs');
+const path = require('path');
+const bcrypt = require('bcryptjs');
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
+
+// روی Railway باید DATA_DIR به یک Volume دائمی اشاره کند، وگرنه با هر
+// دیپلوی جدید دیتابیس (کاربران) از بین می‌رود.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const DB_PATH = path.join(DATA_DIR, 'db.json');
+const adapter = new FileSync(DB_PATH);
+const db = low(adapter);
+
+// ساختار پیش‌فرض دیتابیس در اولین اجرا
+db.defaults({
+  admin: null,      // { username, passwordHash }
+  clients: [],       // لیست کاربران VPN
+  settings: {
+    // دامنه‌ای که Railway به این سرویس داده (یا دامنه‌ی اختصاصی شما)
+    domain: process.env.DOMAIN || process.env.RAILWAY_PUBLIC_DOMAIN || '',
+  },
+}).write();
+
+// اگر ادمین هنوز ساخته نشده، از مقادیر .env بساز
+function ensureAdmin() {
+  const admin = db.get('admin').value();
+  if (!admin) {
+    const username = process.env.ADMIN_USERNAME || 'admin';
+    const password = process.env.ADMIN_PASSWORD || 'admin';
+    const passwordHash = bcrypt.hashSync(password, 10);
+    db.set('admin', { username, passwordHash }).write();
+    console.log(`[panel] کاربر ادمین اولیه ساخته شد → username: ${username}`);
+  }
+}
+
+module.exports = { db, ensureAdmin };
+
+const httpProxy = require('http-proxy');
+const { INTERNAL_PORTS, WS_PATHS } = require('./xray/configBuilder');
+
+const proxy = httpProxy.createProxyServer({ ws: true });
+
+proxy.on('error', (err, req, res) => {
+  console.error('[proxy] خطا:', err.message);
+  if (res && res.writeHead) {
+    res.writeHead(502);
+    res.end('Bad gateway');
+  }
+});
+
+function targetForPath(pathname) {
+  if (pathname.startsWith(WS_PATHS.vless)) return `http://127.0.0.1:${INTERNAL_PORTS.vless}`;
+  if (pathname.startsWith(WS_PATHS.vmess)) return `http://127.0.0.1:${INTERNAL_PORTS.vmess}`;
+  if (pathname.startsWith(WS_PATHS.trojan)) return `http://127.0.0.1:${INTERNAL_PORTS.trojan}`;
+  return null;
+}
+
+/**
+ * روی سرور HTTP خام (http.createServer) صدا زده می‌شود تا رویداد
+ * 'upgrade' (هندشیک وب‌ساکت) را به اینباند صحیح Xray فوروارد کند.
+ */
+function attachWsProxy(server) {
+  server.on('upgrade', (req, socket, head) => {
+    const target = targetForPath(req.url);
+    if (!target) {
+      socket.destroy();
+      return;
+    }
+    proxy.ws(req, socket, head, { target });
+  });
+}
+
+module.exports = { attachWsProxy };
+
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const { db } = require('../db');
+const { signToken } = require('../auth');
+
+const router = express.Router();
+
+router.post('/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'نام کاربری و رمز عبور الزامی است' });
+  }
+
+  const admin = db.get('admin').value();
+  if (!admin || admin.username !== username) {
+    return res.status(401).json({ error: 'نام کاربری یا رمز عبور اشتباه است' });
+  }
+
+  const ok = bcrypt.compareSync(password, admin.passwordHash);
+  if (!ok) {
+    return res.status(401).json({ error: 'نام کاربری یا رمز عبور اشتباه است' });
+  }
+
+  const token = signToken({ username: admin.username });
+  res.json({ token });
+});
+
+module.exports = router;
+
+const express = require('express');
+const { db } = require('../db');
+const { requireAuth } = require('../auth');
+const { newClientId, newTrojanPassword, newSubToken } = require('../utils/id');
+const { buildClientLink, buildSubscriptionPayload } = require('../utils/links');
+const { syncXray } = require('../xray/runner');
+
+const router = express.Router();
+
+// همه‌ی روت‌های این فایل نیاز به لاگین ادمین دارند
+router.use(requireAuth);
+
+// لیست همه‌ی کلاینت‌ها به همراه لینک اتصال آماده
+router.get('/', (req, res) => {
+  const clients = db.get('clients').value();
+  const withLinks = clients.map((c) => ({ ...c, link: buildClientLink(c) }));
+  res.json(withLinks);
+});
+
+// ساخت کلاینت جدید
+router.post('/', async (req, res) => {
+  const { name, protocol, expiresAt, trafficLimitGB } = req.body || {};
+
+  if (!name || !['vless', 'vmess', 'trojan'].includes(protocol)) {
+    return res.status(400).json({ error: 'نام و پروتکل معتبر (vless/vmess/trojan) الزامی است' });
+  }
+
+  const client = {
+    id: newSubToken(),
+    subToken: newSubToken(),
+    name,
+    protocol,
+    uuid: newClientId(),
+    trojanPassword: newTrojanPassword(),
+    enabled: true,
+    expiresAt: expiresAt || null,
+    trafficLimitGB: trafficLimitGB || null,
+    createdAt: new Date().toISOString(),
+  };
+
+  db.get('clients').push(client).write();
+
+  try {
+    await syncXray();
+  } catch (e) {
+    // اگر روی خود سرور اجرا نشده باشد (مثلاً محیط تست) فقط لاگ می‌کنیم
+    console.warn('[warn] sync با Xray انجام نشد:', e.message);
+  }
+
+  res.status(201).json({ ...client, link: buildClientLink(client) });
+});
+
+// فعال/غیرفعال کردن یا ویرایش یک کلاینت
+router.patch('/:id', async (req, res) => {
+  const { id } = req.params;
+  const client = db.get('clients').find({ id }).value();
+  if (!client) return res.status(404).json({ error: 'کلاینت پیدا نشد' });
+
+  const allowed = ['name', 'enabled', 'expiresAt', 'trafficLimitGB'];
+  const updates = {};
+  for (const key of allowed) {
+    if (key in (req.body || {})) updates[key] = req.body[key];
+  }
+
+  db.get('clients').find({ id }).assign(updates).write();
+
+  try {
+    await syncXray();
+  } catch (e) {
+    console.warn('[warn] sync با Xray انجام نشد:', e.message);
+  }
+
+  res.json(db.get('clients').find({ id }).value());
+});
+
+// حذف کلاینت
+router.delete('/:id', async (req, res) => {
+  const { id } = req.params;
+  db.get('clients').remove({ id }).write();
+
+  try {
+    await syncXray();
+  } catch (e) {
+    console.warn('[warn] sync با Xray انجام نشد:', e.message);
+  }
+
+  res.status(204).end();
+});
+
+// لینک سابسکریپشن عمومی (بدون نیاز به لاگین، فقط با توکن مخفی هر کاربر)
+// این روت در server.js جدا از requireAuth ثبت می‌شود.
+function subscriptionHandler(req, res) {
+  const { token } = req.params;
+  const client = db.get('clients').find({ subToken: token }).value();
+  if (!client) return res.status(404).send('not found');
+
+  const payload = buildSubscriptionPayload(client);
+  res.set('Content-Type', 'text/plain; charset=utf-8');
+  res.send(payload);
+}
+
+module.exports = { router, subscriptionHandler };
+
+const express = require('express');
+const { db } = require('../db');
+const { requireAuth } = require('../auth');
+const { syncXray } = require('../xray/runner');
+
+const router = express.Router();
+router.use(requireAuth);
+
+router.get('/', (req, res) => {
+  res.json(db.get('settings').value());
+});
+
+router.put('/', async (req, res) => {
+  // فقط دامنه قابل تنظیم است؛ روی Railway پورت‌ها همیشه از طریق 443/wss هستند
+  const { domain } = req.body || {};
+  const updates = {};
+  if (domain) updates.domain = domain;
+
+  db.get('settings').assign(updates).write();
+
+  try {
+    await syncXray();
+  } catch (e) {
+    console.warn('[warn] sync با Xray انجام نشد:', e.message);
+  }
+
+  res.json(db.get('settings').value());
+});
+
+module.exports = router;
+
+const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+
+function newClientId() {
+  return uuidv4(); // برای VLESS و VMess به عنوان id مصرف می‌شود
+}
+
+function newTrojanPassword() {
+  return crypto.randomBytes(12).toString('hex'); // پسورد Trojan
+}
+
+function newSubToken() {
+  return crypto.randomBytes(16).toString('hex'); // توکن لینک سابسکریپشن
+}
+
+module.exports = { newClientId, newTrojanPassword, newSubToken };
+
+const { db } = require('../db');
+const { WS_PATHS } = require('../xray/configBuilder');
+
+function getDomain() {
+  const s = db.get('settings').value();
+  return s.domain || process.env.RAILWAY_PUBLIC_DOMAIN || 'YOUR-DOMAIN.up.railway.app';
+}
+
+// همه‌ی ترافیک از پورت 443 و روی wss (TLS واقعی توسط Railway انجام می‌شود)
+const PUBLIC_PORT = 443;
+
+function buildVlessLink(client) {
+  const domain = getDomain();
+  const params = `security=tls&type=ws&host=${domain}&path=${encodeURIComponent(WS_PATHS.vless)}&sni=${domain}`;
+  return `vless://${client.uuid}@${domain}:${PUBLIC_PORT}?${params}#${encodeURIComponent(client.name)}`;
+}
+
+function buildVmessLink(client) {
+  const domain = getDomain();
+  const vmessObj = {
+    v: '2',
+    ps: client.name,
+    add: domain,
+    port: String(PUBLIC_PORT),
+    id: client.uuid,
+    aid: '0',
+    net: 'ws',
+    path: WS_PATHS.vmess,
+    type: 'none',
+    host: domain,
+    tls: 'tls',
+  };
+  const encoded = Buffer.from(JSON.stringify(vmessObj)).toString('base64');
+  return `vmess://${encoded}`;
+}
+
+function buildTrojanLink(client) {
+  const domain = getDomain();
+  const params = `security=tls&type=ws&host=${domain}&path=${encodeURIComponent(WS_PATHS.trojan)}&sni=${domain}`;
+  return `trojan://${client.trojanPassword}@${domain}:${PUBLIC_PORT}?${params}#${encodeURIComponent(client.name)}`;
+}
+
+function buildClientLink(client) {
+  if (client.protocol === 'vless') return buildVlessLink(client);
+  if (client.protocol === 'vmess') return buildVmessLink(client);
+  if (client.protocol === 'trojan') return buildTrojanLink(client);
+  throw new Error('پروتکل ناشناخته');
+}
+
+function buildSubscriptionPayload(client) {
+  const link = buildClientLink(client);
+  return Buffer.from(link, 'utf-8').toString('base64');
+}
+
+module.exports = { buildClientLink, buildSubscriptionPayload };
+
+const { db } = require('../db');
+
+function isActive(client) {
+  if (!client.enabled) return false;
+  if (client.expiresAt && new Date(client.expiresAt).getTime() < Date.now()) return false;
+  return true;
+}
+
+function buildVlessClients() {
+  return db.get('clients')
+    .filter((c) => c.protocol === 'vless' && isActive(c))
+    .value()
+    .map((c) => ({ id: c.uuid, email: c.name, level: 0 }));
+}
+
+function buildVmessClients() {
+  return db.get('clients')
+    .filter((c) => c.protocol === 'vmess' && isActive(c))
+    .value()
+    .map((c) => ({ id: c.uuid, email: c.name, level: 0, alterId: 0 }));
+}
+
+function buildTrojanClients() {
+  return db.get('clients')
+    .filter((c) => c.protocol === 'trojan' && isActive(c))
+    .value()
+    .map((c) => ({ password: c.trojanPassword, email: c.name, level: 0 }));
+}
+
+// پورت‌های داخلی ثابت (فقط روی 127.0.0.1، هرگز مستقیم به بیرون اکسپوز نمی‌شوند)
+const INTERNAL_PORTS = { vless: 10001, vmess: 10002, trojan: 10003 };
+// مسیرهای WebSocket که سرور Node جلوی آن‌ها ریورس‌پروکسی می‌کند
+const WS_PATHS = { vless: '/vless-ws', vmess: '/vmess-ws', trojan: '/trojan-ws' };
+
+/**
+ * کانفیگ Xray برای اجرا پشت Railway (بدون TLS داخلی؛ ترافیک cleartext روی
+ * لوکال‌هاست است چون TLS واقعی توسط لبه‌ی Railway انجام می‌شود).
+ * سه اینباند مستقل روی WebSocket، هرکدام با یک پورت داخلی و مسیر جدا.
+ */
+function buildXrayConfig() {
+  return {
+    log: { loglevel: 'warning' },
+    inbounds: [
+      {
+        tag: 'vless-in',
+        listen: '127.0.0.1',
+        port: INTERNAL_PORTS.vless,
+        protocol: 'vless',
+        settings: { clients: buildVlessClients(), decryption: 'none' },
+        streamSettings: {
+          network: 'ws',
+          security: 'none',
+          wsSettings: { path: WS_PATHS.vless },
+        },
+      },
+      {
+        tag: 'vmess-in',
+        listen: '127.0.0.1',
+        port: INTERNAL_PORTS.vmess,
+        protocol: 'vmess',
+        settings: { clients: buildVmessClients() },
+        streamSettings: {
+          network: 'ws',
+          security: 'none',
+          wsSettings: { path: WS_PATHS.vmess },
+        },
+      },
+      {
+        tag: 'trojan-in',
+        listen: '127.0.0.1',
+        port: INTERNAL_PORTS.trojan,
+        protocol: 'trojan',
+        settings: { clients: buildTrojanClients() },
+        streamSettings: {
+          network: 'ws',
+          security: 'none',
+          wsSettings: { path: WS_PATHS.trojan },
+        },
+      },
+    ],
+    outbounds: [
+      { protocol: 'freedom', tag: 'direct' },
+      { protocol: 'blackhole', tag: 'block' },
+    ],
+  };
+}
+
+module.exports = { buildXrayConfig, INTERNAL_PORTS, WS_PATHS };
+
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const { buildXrayConfig } = require('./configBuilder');
+
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
+const CONFIG_PATH = path.join(DATA_DIR, 'xray-config.json');
+const XRAY_BIN = process.env.XRAY_BIN_PATH || 'xray';
+
+let xrayProcess = null;
+
+function writeConfig() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const config = buildXrayConfig();
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf-8');
+}
+
+function startXray() {
+  writeConfig();
+  xrayProcess = spawn(XRAY_BIN, ['run', '-config', CONFIG_PATH], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  xrayProcess.stdout.on('data', (d) => process.stdout.write(`[xray] ${d}`));
+  xrayProcess.stderr.on('data', (d) => process.stderr.write(`[xray:err] ${d}`));
+
+  xrayProcess.on('exit', (code, signal) => {
+    console.log(`[xray] پروسه با کد ${code} (سیگنال ${signal}) متوقف شد`);
+    xrayProcess = null;
+  });
+
+  console.log('[xray] پروسه اجرا شد.');
+}
+
+/**
+ * بعد از هر تغییر در کاربران/تنظیمات، کانفیگ جدید نوشته و پروسه‌ی Xray
+ * ری‌استارت می‌شود (چون Xray پشتیبانی از hot-reload کامل ندارد).
+ */
+function syncXray() {
+  return new Promise((resolve) => {
+    if (xrayProcess) {
+      xrayProcess.once('exit', () => {
+        startXray();
+        resolve();
+      });
+      xrayProcess.kill('SIGTERM');
+    } else {
+      startXray();
+      resolve();
+    }
+  });
+}
+
+module.exports = { startXray, syncXray };
